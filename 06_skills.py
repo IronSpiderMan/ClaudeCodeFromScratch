@@ -1,0 +1,443 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+# @Author: ZackFair
+# @Desc: 
+# @File: 06_skills.py
+# @Date: 2026/4/11 20:57
+import re
+import json
+import subprocess
+from enum import Enum
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+
+from openai import Client
+
+from common.config import WORKDIR, AgentConfig
+
+from pydantic import BaseModel
+
+
+class SkillManifest(BaseModel):
+    name: str
+    description: str
+    path: Path
+
+
+class Skill(BaseModel):
+    manifest: SkillManifest
+    body: str
+
+
+class SkillManager:
+
+    def __init__(self, skills_dir: str):
+        self.skills_dir = Path(skills_dir)
+        self.skills: Dict[str, Skill] = {}
+        self._load_skills()
+
+    def _load_skills(self):
+        if not self.skills_dir.exists():
+            return
+
+        for path in sorted(self.skills_dir.rglob("SKILL.md")):
+            meta, body = self._parse_frontmatter(path.read_text(encoding="utf-8"))
+            name = meta.get('name', path.parent.name)
+            description = meta.get('description', 'No description')
+            manifest = SkillManifest(name=name, description=description, path=path)
+            self.skills[name] = Skill(manifest=manifest, body=body)
+
+    @staticmethod
+    def _parse_frontmatter(text: str) -> Tuple[Dict, str]:
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+        if not match:
+            return {}, text
+
+        meta = {}
+        for line in match.group(1).strip().splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            meta[key.strip()] = value.strip()
+        return meta, match.group(2)
+
+    def preview_skills(self):
+        if not self.skills:
+            return "(no skills available)"
+        lines = []
+        for name in sorted(self.skills):
+            manifest = self.skills[name].manifest
+            lines.append(f"- {manifest.name}: {manifest.description}")
+        return "\n".join(lines)
+
+    def load_skill(self, name: str) -> str:
+        skill = self.skills.get(name)
+        if not skill:
+            return f"Error: Unnamed skill: {name}"
+        return (
+            f"<skill name='{skill.manifest.name}'>\n"
+            f"{skill.body}\n"
+            f"</skill>"
+        )
+
+
+class PlanItemStatus(str, Enum):
+    pending = "pending"
+    in_progress = "in_progress"
+    completed = "completed"
+
+
+class PlanItem(BaseModel):
+    content: str
+    status: PlanItemStatus = 'pending'
+    parent: Optional[str] = None
+
+
+class TodoManager:
+
+    def __init__(self, max_items: int = 12):
+        self.items: List[PlanItem] = []
+        self.max_items = max_items
+
+    def update(self, items: List[PlanItem]) -> str:
+        if len(items) > self.max_items:
+            raise ValueError(f"Keep the session plan short than {self.max_items} items.")
+
+        if sum([item.status == PlanItemStatus.in_progress for item in items]) > 1:
+            raise ValueError(f"Only one item can be in progress.")
+
+        self.items = items
+        return self.render()
+
+    def render(self):
+        lines = []
+        for item in self.items:
+            marker = {
+                "pending": "[ ]",
+                "in_progress": "[>]",
+                "completed": "[x]",
+            }[item.status]
+            line = f"{marker} {item.content}"
+            if item.status == "in_progress" and item.parent:
+                line += f" ({item.parent})"
+            lines.append(line)
+        completed = sum(1 for item in self.items if item.status == "completed")
+        lines.append(f"\n({completed}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+
+class Agent:
+
+    def __init__(
+            self,
+            config: AgentConfig,
+            tools: Optional[List] = None
+    ):
+        self.config = config
+        self.client = Client(
+            base_url=self.config.base_url,
+            api_key=self.config.api_key
+        )
+        self.tools = tools
+
+    def run(self, messages: List[Dict]) -> List[Dict]:
+        system_prompt = [{'role': 'system', 'content': self.config.system_prompt}]
+        response = self.client.chat.completions.create(
+            model=self.config.model,
+            messages=system_prompt + messages,
+            tools=self.tools,
+        )
+        if not response.choices[0].finish_reason == 'tool_calls':
+            return messages + [response.choices[0].message.model_dump()]
+
+        # 加入工具调用消息
+        messages.append(response.choices[0].message.model_dump())
+
+        for tool_call in response.choices[0].message.tool_calls:
+            tool_call_id = tool_call.id
+            name = tool_call.function.name
+            args = tool_call.function.arguments
+
+            print("[Tool Call] >", f"{name}({args})")
+
+            tool = tool_handler.get(name)
+            result = tool(**json.loads(args))
+
+            print("[Tool Result] >", result)
+
+            # 加入工具结果消息
+            messages.append({'role': 'tool', 'content': result, 'tool_call_id': tool_call_id})
+
+        return self.run(messages)
+
+
+todo_manager = TodoManager()
+skill_manager = SkillManager('skills')
+
+
+def todo(items: List[PlanItem]) -> str:
+    if isinstance(items, str):
+        items = json.loads(items)
+    for idx, item in enumerate(items):
+        if isinstance(item, dict):
+            items[idx] = PlanItem(**item)
+    return todo_manager.update(items)
+
+
+def run_bash(command: str) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=WORKDIR,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return "Error: Timeout (120s)"
+
+    return (result.stdout + result.stderr).strip() or "(no output)"
+
+
+def read_file(path: str, limit: Optional[int] = None) -> str:
+    try:
+        lines = Path(path).read_text().splitlines()
+        if limit and limit <= len(lines):
+            lines = lines[: limit] + [f"...({len(lines) - limit} more liens)"]
+        output = "\n".join(lines)
+        return output
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def edit_file(path: str, old_text: str, new_text: str) -> str:
+    try:
+        fp = Path(path)
+        content = fp.read_text()
+        if old_text not in content:
+            return f"Error: Text not found in {path}"
+        fp.write_text(content.replace(old_text, new_text, 1))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def write_file(path: str, text: str) -> str:
+    try:
+        fp = Path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(text)
+        return f"Wrote {len(text)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_subagent(prompt: str) -> str:
+    subagent = Agent(
+        AgentConfig(
+            system_prompt="""Must use the todo tool for multi-step work.
+Keep exactly one step in_progress when a task has multiple steps.
+Refresh the plan as work advances. Prefer tools over prose."""
+        ),
+        tools=common_tools
+    )
+    return subagent.run([{'role': 'user', 'content': prompt}])[-1].get('content')
+
+
+def load_skill(name: str) -> str:
+    return skill_manager.load_skill(name)
+
+
+common_tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_bash",
+            "description": "Run a bash command.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The command to run."
+                    }
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of lines to read."
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file (overwrite if exists)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Content to write"
+                    }
+                },
+                "required": ["path", "text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Edit a file by replacing old text with new text (only first occurrence)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path"
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Text to replace"
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text"
+                    }
+                },
+                "required": ["path", "old_text", "new_text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo",
+            "description": "Update the agent's task plan.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "Ordered list of plan items.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "Content of the plan."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Status of the plan."
+                                },
+                                "parent": {
+                                    "type": "string",
+                                    "description": "Parent of the plan."
+                                }
+                            }
+                        }
+                    },
+                },
+                "required": ["items"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "Load the full body of a named skill into the current context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The skill to load."
+                    }
+                },
+                "required": ["name"]
+            }
+        }
+    },
+]
+
+tools = common_tools + [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_subagent",
+            "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Short description of the task."
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }
+    },
+]
+
+tool_handler = {
+    'run_bash': run_bash,
+    'read_file': read_file,
+    'edit_file': edit_file,
+    'write_file': write_file,
+    'todo': todo,
+    'load_skill': load_skill,
+    'run_subagent': run_subagent,
+}
+
+if __name__ == '__main__':
+    agent = Agent(
+        AgentConfig(
+            system_prompt=f"""Must use the todo tool for multi-step work.
+Keep exactly one step in_progress when a task has multiple steps.
+Refresh the plan as work advances. Prefer tools over prose.
+    
+Use load_skill when a task needs specialized instructions before you act.
+
+Skills available:
+{skill_manager.preview_skills()}
+"""
+        ),
+        tools=tools,
+    )
+
+    history = []
+    while True:
+        i = input("Human >")
+        if i == 'q':
+            break
+        history.append({'role': 'user', 'content': i})
+        history = agent.run(history)
+        print("Assistant >", history[-1].get('content'))
